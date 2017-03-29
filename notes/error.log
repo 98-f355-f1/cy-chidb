@@ -1,0 +1,16 @@
+Running suite(s): B-Trees
+63%: Checks: 38, Failures: 14, Errors: 0
+tests/check_btree_4.c:18:F:Step 4: Manipulating B-Tree cells:test_4_1:0: Assertion 'btc.key == 35' failed
+tests/check_btree_4.c:41:F:Step 4: Manipulating B-Tree cells:test_4_2:0: Assertion 'btc.key == 127' failed
+tests/check_btree_4.c:75:F:Step 4: Manipulating B-Tree cells:test_4_3:0: Assertion 'btn->n_cells == old_ncell + 1' failed
+tests/check_btree_4.c:122:F:Step 4: Manipulating B-Tree cells:test_4_4:0: Assertion 'btn->n_cells == old_ncell + 1' failed
+tests/check_btree_common.c:97:F:Step 5: Finding a value in a B-Tree:test_5_1:0: Assertion 'size == 128' failed
+tests/check_btree_5.c:34:F:Step 5: Finding a value in a B-Tree:test_5_2:0: Assertion 'rc == (9)' failed
+tests/check_btree_common.c:97:F:Step 6: Insertion into a leaf without splitting:test_6_1:0: Assertion 'size == 128' failed
+tests/check_btree_common.c:97:F:Step 6: Insertion into a leaf without splitting:test_6_2:0: Assertion 'size == 128' failed
+tests/check_btree_common.c:133:F:Step 7: Insertion with splitting:test_7_1:0: Assertion 'size == datalen' failed
+tests/check_btree_common.c:133:F:Step 7: Insertion with splitting:test_7_2:0: Assertion 'size == datalen' failed
+tests/check_btree_common.c:133:F:Step 7: Insertion with splitting:test_7_3:0: Assertion 'size == datalen' failed
+tests/check_btree_common.c:196:F:Step 8: Supporting index B-Trees:test_8_1:0: Assertion 'rc == (0)' failed
+tests/check_btree_common.c:196:F:Step 8: Supporting index B-Trees:test_8_2:0: Assertion 'rc == (0)' failed
+tests/check_btree_common.c:196:F:Step 8: Supporting index B-Trees:test_8_3:0: Assertion 'rc == (0)' failed
