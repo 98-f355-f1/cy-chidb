@@ -64,7 +64,9 @@ ptrdiff_t getCellOffsetOffset(uint8_t type);
 int verifyHeader(uint8_t *buf_head);
 void packBufToNode(MemPage *page, BTreeNode *btn);
 void unpackNodeToBuf(BTreeNode *btn, MemPage *page);
-void packBufToCell(uint8_t *head, uint8_t type, BTreeCell *btc);
+void packBTC(uint8_t *head, BTreeCell *btc, uint8_t type);
+void unpackBTC(uint8_t *head, BTreeCell *btc);
+size_t cellGetSize(BTreeCell *btc);
 
 /* Avoid clobbering 100B file header on page 1 when converting a note 
  * to / from a buffer & BTreeNode struct.
@@ -173,8 +175,9 @@ void packBufToNode(MemPage *page, BTreeNode *btn)
  * - type: code indicating the cell type
  * - btc: cell struct that will store data
  */
-void packBufToCell(uint8_t *head, uint8_t type, BTreeCell *btc)
+void packBTC(uint8_t *head, BTreeCell *btc, uint8_t type)
 {
+    btc->type = type;
     if (type == PGTYPE_TABLE_INTERNAL)
     {
         getVarint32(head + TABLEINTCELL_KEY_OFFSET, &btc->key);
@@ -184,8 +187,8 @@ void packBufToCell(uint8_t *head, uint8_t type, BTreeCell *btc)
     else if (type == PGTYPE_TABLE_LEAF)
     {
         getVarint32(head + TABLELEAFCELL_KEY_OFFSET, &btc->key);
-        getVarint32(head + TABLELEAFCELL_SIZE_OFFSET, 
-                    &btc->fields.tableLeaf.data_size);
+        getVarint32(head + TABLELEAFCELL_SIZE_OFFSET,
+                &btc->fields.tableLeaf.data_size);
         btc->fields.tableLeaf.data = head + TABLELEAFCELL_DATA_OFFSET;
     }
     else if (type == PGTYPE_INDEX_INTERNAL)
@@ -196,20 +199,73 @@ void packBufToCell(uint8_t *head, uint8_t type, BTreeCell *btc)
         btc->fields.indexInternal.child_page =
             get4byte(head + INDEXINTCELL_CHILD_OFFSET);
     }
-    else if (type == PGTYPE_INDEX_LEAF)
+    else // (type == PGTYPE_INDEX_LEAF)
     {
         btc->key = get4byte(head + INDEXLEAFCELL_KEYIDX_OFFSET);
         btc->fields.indexLeaf.keyPk =
             get4byte(head + INDEXLEAFCELL_KEYPK_OFFSET);
     }
-    else
-    {
-        // TODO XXX
-        // Error handling for unknown type
-        return;
-    }
-    btc->type = type;
     return;
+}
+
+void unpackBTC(uint8_t *head, BTreeCell *btc)
+{
+    uint8_t type = btc->type;
+    if (type == PGTYPE_TABLE_INTERNAL)
+    {
+        putVarint32(head + TABLEINTCELL_KEY_OFFSET, btc->key);
+        put4byte(head + TABLEINTCELL_CHILD_OFFSET,
+                btc->fields.tableInternal.child_page);
+    }
+    else if (type == PGTYPE_TABLE_LEAF)
+    {
+        putVarint32(head + TABLELEAFCELL_KEY_OFFSET, btc->key);
+        putVarint32(head + TABLELEAFCELL_SIZE_OFFSET, 
+                    btc->fields.tableLeaf.data_size);
+        uint8_t *record_head = head + TABLELEAFCELL_DATA_OFFSET;
+        memmove(record_head,
+                btc->fields.tableLeaf.data,
+                btc->fields.tableLeaf.data_size);
+    }
+    else if (type == PGTYPE_INDEX_INTERNAL)
+    {
+        put4byte(head + INDEXINTCELL_KEYIDX_OFFSET, btc->key);
+        put4byte(head + INDEXINTCELL_KEYPK_OFFSET,
+                btc->fields.indexInternal.keyPk);
+        put4byte(head + INDEXINTCELL_CHILD_OFFSET,
+                btc->fields.indexInternal.child_page);
+    }
+    else // (type == PGTYPE_INDEX_LEAF)
+    {
+        put4byte(head + INDEXLEAFCELL_KEYIDX_OFFSET, btc->key);
+        put4byte(head + INDEXLEAFCELL_KEYPK_OFFSET,
+                btc->fields.indexLeaf.keyPk);
+    }
+}
+
+/* Using the data of a BTreeCell struct, determine and return
+ * the size of the cell encoded in the chidb file format.
+ */
+size_t cellGetSize(BTreeCell *btc)
+{
+    uint8_t type = btc->type;
+    if (type == PGTYPE_TABLE_INTERNAL)
+    {
+        return TABLEINTCELL_SIZE;
+    }
+    else if (type == PGTYPE_TABLE_LEAF)
+    {
+        return TABLELEAFCELL_SIZE_WITHOUTDATA +
+                btc->fields.tableLeaf.data_size;
+    }
+    else if (type == PGTYPE_INDEX_INTERNAL)
+    {
+        return INDEXINTCELL_SIZE;
+    }
+    else // (type == PGTYPE_INDEX_LEAF)
+    {
+        return  INDEXLEAFCELL_SIZE;
+    }
 }
 
 /* Open a B-Tree file
@@ -527,9 +583,9 @@ int chidb_Btree_getCell(BTreeNode *btn, ncell_t ncell, BTreeCell *cell)
     {
         return CHIDB_ECELLNO;
     }
-    ptrdiff_t cell_offset = get2byte(btn->celloffset_array + 2*(ncell));
+    ptrdiff_t cell_offset = get2byte(btn->celloffset_array + 2*ncell);
     uint8_t *head = btn->page->data + cell_offset;
-    packBufToCell(head, btn->type, cell);
+    packBTC(head, cell, btn->type);
     return CHIDB_OK;
 }
 
@@ -558,46 +614,25 @@ int chidb_Btree_getCell(BTreeNode *btn, ncell_t ncell, BTreeCell *cell)
  */
 int chidb_Btree_insertCell(BTreeNode *btn, ncell_t ncell, BTreeCell *cell)
 {
-    if (ncell > btn->n_cells + 1)
+    if (ncell > btn->n_cells)
     {
         return CHIDB_ECELLNO;
     }
 
-    uint8_t *head;
-    if (cell->type == PGTYPE_TABLE_INTERNAL)
-    {
-        head = btn->page->data + btn->cells_offset - TABLEINTCELL_SIZE;
-        putVarint32(head + TABLEINTCELL_KEY_OFFSET, cell->key);
-        put4byte(head + TABLEINTCELL_CHILD_OFFSET,
-                cell->fields.tableInternal.child_page);
-    }
-    else if (cell->type == PGTYPE_TABLE_LEAF)
-    {
-        head = btn->page->data + btn->cells_offset - 
-               (TABLELEAFCELL_SIZE_WITHOUTDATA +
-               cell->fields.tableLeaf.data_size);
-        putVarint32(head + TABLELEAFCELL_KEY_OFFSET, cell->key);
-        putVarint32(head + TABLELEAFCELL_SIZE_OFFSET, 
-                    cell->fields.tableLeaf.data_size);
-    }
-    else if (cell->type == PGTYPE_INDEX_INTERNAL)
-    {
-        head = btn->page->data + btn->cells_offset - INDEXINTCELL_SIZE;
-        put4byte(head + INDEXINTCELL_KEYIDX_OFFSET, cell->key);
-        put4byte(head + INDEXINTCELL_KEYPK_OFFSET,
-                cell->fields.indexInternal.keyPk);
-        put4byte(head + INDEXINTCELL_CHILD_OFFSET,
-                cell->fields.indexInternal.child_page);
-    }
-    else // (cell->type == PGTYPE_INDEX_LEAF)
-    {
-        head = btn->page->data + btn->cells_offset - INDEXLEAFCELL_SIZE;
-        put4byte(head + INDEXLEAFCELL_KEYIDX_OFFSET, cell->key);
-        put4byte(head + INDEXLEAFCELL_KEYPK_OFFSET,
-                cell->fields.indexLeaf.keyPk);
-    }
+    ncell_t old_n_cells = btn->n_cells;
+    btn->n_cells += 1;
+    ptrdiff_t cell_offset = btn->cells_offset -= cellGetSize(cell);
 
-    ptrdiff_t new_offset = 2*ncell;
+    unpackBTC(&btn->page->data[cell_offset], cell);
+
+    if (ncell < old_n_cells)
+    {
+        memmove(&btn->celloffset_array[2*(ncell+1)],
+                &btn->celloffset_array[2*ncell],
+                2*(old_n_cells-ncell));
+    }
+    put2byte(&btn->celloffset_array[2*ncell], cell_offset);
+    btn->free_offset += 2;
 
     return CHIDB_OK;
 }
