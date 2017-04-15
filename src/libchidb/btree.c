@@ -54,219 +54,22 @@
 #include "util.h"
 
 #define CHIDB_FILE_HEADER_LEN (100)
-#define PGTYPE_BMASK_LEAF (0x08)
-#define PGTYPE_BMASK_INDEX (0x02)
-#define PGTYPE_BMASK_TABLE (0x05)
 
-ptrdiff_t getHeaderOffset(npage_t npage);
-bool internalNode(uint8_t type);
-ptrdiff_t getCellOffsetOffset(uint8_t type);
-int verifyHeader(uint8_t *buf_head);
-void packBufToNode(MemPage *page, BTreeNode *btn);
-void unpackNodeToBuf(BTreeNode *btn, MemPage *page);
-void packBTC(uint8_t *head, BTreeCell *btc, uint8_t type);
-void unpackBTC(uint8_t *head, BTreeCell *btc);
-size_t cellGetSize(BTreeCell *btc);
+/* chidb node type masks */
+#define FLAG_TABLE (0x01|0x04)
+#define FLAG_INDEX (0x02)
+#define FLAG_LEAF (0x08)
 
-/* Avoid clobbering 100B file header on page 1 when converting a note 
- * to / from a buffer & BTreeNode struct.
- */
-ptrdiff_t getHeaderOffset(npage_t npage)
-{
-    return (npage == 1) ? CHIDB_FILE_HEADER_LEN : 0;
-}
-
-/* Given a type code return the offset of the cell offset array in a page of
- * that type. This value can also be interpreted as the length of the
- * page header.
- */
-ptrdiff_t getCellOffsetOffset(uint8_t type)
-{
-    return internalNode(type) ?
-        INTPG_CELLSOFFSET_OFFSET : LEAFPG_CELLSOFFSET_OFFSET;
-}
-
-/* Determine whether or not a type code is internal.
- * This property can be queried with a bitmask however
- */
-bool internalNode(uint8_t type)
-{
-    return !(type & PGTYPE_BMASK_LEAF);
-}
-
-/* Check for default values for file header fields
- *
- * Parameters:
- * - buf: pointer to 100 byte buffer storing a file header
- *
- * Return:
- * - CHIDB_OK: File header is valid.
- * - CHIDB_ECORRUPTHEADER: File header is not well formed.
- */
-int verifyHeader(uint8_t *buf_head)
-{
-    /* for the current build, these are the only valid values */
-    bool invalid_header =
-    (
-            strncmp((char*)buf_head, "SQLite format 3" , 16) ||
-            buf_head[18] != 1                        ||
-            buf_head[19] != 1                        ||
-            buf_head[20] != 0                        ||
-            buf_head[21] != 64                       ||
-            buf_head[22] != 32                       ||
-            buf_head[23] != 32                       ||
-//          get4byte(&buf_head[24]) != 0             ||
-            get4byte(&buf_head[32]) != 0             ||
-            get4byte(&buf_head[36]) != 0             ||
-//          get4byte(&buf_head[40]) != 0             ||
-            get4byte(&buf_head[44]) != 1             ||
-            /* check_btree_1a.c: test_1a_4 */
-            get4byte(&buf_head[48]) != 20000         ||
-            get4byte(&buf_head[52]) != 0             ||
-            get4byte(&buf_head[56]) != 1             ||
-//          get4byte(&buf_head[60]) != 0             ||
-            get4byte(&buf_head[64]) != 0
-    );
-    if (invalid_header)
-    {
-        return CHIDB_ECORRUPTHEADER;
-    }
-    else
-    {
-        return CHIDB_OK;
-    }
-}
-
-/* Pack a BTreeNode with page header data
- * The purpose of this function is to abstract the task of parsing and casting
- * unstructured data from a buffered page header.
- *
- * Notes:
- * - All resources pointed to by parameters are assumed to be 
- *   already allocated.
- * - The page is assumed to be well-formed.
- * - On leaf nodes, the .right_page field will be set to 0 to indicate
- *   that it is inapplicable.
- * Parameters:
- * - page: the MemPage struct that provides access to a buffered page
- * - btn: the external BTreeNode struct to pack as an out parameter
- */
-void packBufToNode(MemPage *page, BTreeNode *btn)
-{
-    uint8_t *head = page->data + getHeaderOffset(page->npage);
-    uint8_t type = head[PGHEADER_PGTYPE_OFFSET];
-    btn->page = page;
-    btn->type = type;
-    btn->free_offset = get2byte(head + PGHEADER_FREE_OFFSET);
-    btn->n_cells = get2byte(head + PGHEADER_NCELLS_OFFSET);
-    btn->cells_offset = get2byte(head + PGHEADER_CELL_OFFSET);
-    btn->celloffset_array = head + getCellOffsetOffset(btn->type);
-    btn->right_page = internalNode(btn->type) ?
-        get4byte(head + PGHEADER_RIGHTPG_OFFSET) : 0;
-}
-
-/* Read cell data from buffer and cast to BTreeCell struct of appropriate type.
- *
- * 1. Determine correct offsets to cast from based on type code param.
- * 2. Read data from buffer and cast to cell struct members.
- *
- * Parameters:
- * - head: u8 pointer to the first byte of a cell in memory.
- * - type: code indicating the cell type
- * - btc: cell struct that will store data
- */
-void packBTC(uint8_t *head, BTreeCell *btc, uint8_t type)
-{
-    btc->type = type;
-    if (type == PGTYPE_TABLE_INTERNAL)
-    {
-        getVarint32(head + TABLEINTCELL_KEY_OFFSET, &btc->key);
-        btc->fields.tableInternal.child_page = 
-            get4byte(head + TABLEINTCELL_CHILD_OFFSET);
-    }
-    else if (type == PGTYPE_TABLE_LEAF)
-    {
-        getVarint32(head + TABLELEAFCELL_KEY_OFFSET, &btc->key);
-        getVarint32(head + TABLELEAFCELL_SIZE_OFFSET,
-                &btc->fields.tableLeaf.data_size);
-        btc->fields.tableLeaf.data = head + TABLELEAFCELL_DATA_OFFSET;
-    }
-    else if (type == PGTYPE_INDEX_INTERNAL)
-    {
-        btc->key = get4byte(head + INDEXINTCELL_KEYIDX_OFFSET);
-        btc->fields.indexInternal.keyPk =
-            get4byte(head + INDEXINTCELL_KEYPK_OFFSET);
-        btc->fields.indexInternal.child_page =
-            get4byte(head + INDEXINTCELL_CHILD_OFFSET);
-    }
-    else // (type == PGTYPE_INDEX_LEAF)
-    {
-        btc->key = get4byte(head + INDEXLEAFCELL_KEYIDX_OFFSET);
-        btc->fields.indexLeaf.keyPk =
-            get4byte(head + INDEXLEAFCELL_KEYPK_OFFSET);
-    }
-    return;
-}
-
-void unpackBTC(uint8_t *head, BTreeCell *btc)
-{
-    uint8_t type = btc->type;
-    if (type == PGTYPE_TABLE_INTERNAL)
-    {
-        putVarint32(head + TABLEINTCELL_KEY_OFFSET, btc->key);
-        put4byte(head + TABLEINTCELL_CHILD_OFFSET,
-                btc->fields.tableInternal.child_page);
-    }
-    else if (type == PGTYPE_TABLE_LEAF)
-    {
-        putVarint32(head + TABLELEAFCELL_KEY_OFFSET, btc->key);
-        putVarint32(head + TABLELEAFCELL_SIZE_OFFSET, 
-                    btc->fields.tableLeaf.data_size);
-        uint8_t *record_head = head + TABLELEAFCELL_DATA_OFFSET;
-        memmove(record_head,
-                btc->fields.tableLeaf.data,
-                btc->fields.tableLeaf.data_size);
-    }
-    else if (type == PGTYPE_INDEX_INTERNAL)
-    {
-        put4byte(head + INDEXINTCELL_KEYIDX_OFFSET, btc->key);
-        put4byte(head + INDEXINTCELL_KEYPK_OFFSET,
-                btc->fields.indexInternal.keyPk);
-        put4byte(head + INDEXINTCELL_CHILD_OFFSET,
-                btc->fields.indexInternal.child_page);
-    }
-    else // (type == PGTYPE_INDEX_LEAF)
-    {
-        put4byte(head + INDEXLEAFCELL_KEYIDX_OFFSET, btc->key);
-        put4byte(head + INDEXLEAFCELL_KEYPK_OFFSET,
-                btc->fields.indexLeaf.keyPk);
-    }
-}
-
-/* Using the data of a BTreeCell struct, determine and return
- * the size of the cell encoded in the chidb file format.
- */
-size_t cellGetSize(BTreeCell *btc)
-{
-    uint8_t type = btc->type;
-    if (type == PGTYPE_TABLE_INTERNAL)
-    {
-        return TABLEINTCELL_SIZE;
-    }
-    else if (type == PGTYPE_TABLE_LEAF)
-    {
-        return TABLELEAFCELL_SIZE_WITHOUTDATA +
-                btc->fields.tableLeaf.data_size;
-    }
-    else if (type == PGTYPE_INDEX_INTERNAL)
-    {
-        return INDEXINTCELL_SIZE;
-    }
-    else // (type == PGTYPE_INDEX_LEAF)
-    {
-        return  INDEXLEAFCELL_SIZE;
-    }
-}
+static uint8_t pgtypeMap(uint8_t);
+static ptrdiff_t getHeaderOffset(npage_t);
+static ptrdiff_t getCellOffsetOffset(uint8_t);
+static int verifyHeader(uint8_t *);
+static void packBTN(BTreeNode *, MemPage *);
+static void unpackBTC(uint8_t *, const BTreeCell *);
+static size_t getCellSize(const BTreeCell *); 
+static int nodeBTCArray(BTreeNode *, BTreeCell **);
+static int nodeKeyBSearch(BTreeNode *, BTreeCell *, chidb_key_t, ncell_t *);
+static int cellRecordCpy(BTreeCell *, uint8_t **, uint16_t *);
 
 /* Open a B-Tree file
  * This function opens a database file and verifies that the file
@@ -292,82 +95,77 @@ size_t cellGetSize(BTreeCell *btc)
 int chidb_Btree_open(const char *filename, chidb *db, BTree **bt)
 {
     int rc = CHIDB_OK;
-    *bt = malloc(sizeof(BTree));
+    *bt = malloc(sizeof(**bt));
     if (!*bt)
     {
         rc = CHIDB_ENOMEM;
-        goto exit_open;
+        goto EXIT;
     }
     rc = chidb_Pager_open(&(*bt)->pager, filename);
     if (rc != CHIDB_OK)
     {
-        goto exit_open;
+        goto EXIT;
     }
 
     uint8_t header_buf[100] = {0};
     rc = chidb_Pager_readHeader((*bt)->pager, header_buf);
-    if (rc == CHIDB_OK)
-    {
-        rc = verifyHeader(header_buf);
-        if (rc == CHIDB_OK)
-        {
-            uint16_t page_size = get2byte(header_buf + 16);
-            chidb_Pager_setPageSize((*bt)->pager, page_size);
-            rc = CHIDB_OK;
-        }
-        else
-        {
-            rc = CHIDB_ECORRUPTHEADER;
-        }
-    }
-    else /* Init default header and empty node on page 1. */
+    if (rc != CHIDB_OK) /* Init default header and empty node on page 1. */
     {
         chidb_Pager_setPageSize((*bt)->pager, DEFAULT_PAGE_SIZE);
         npage_t npage;
         rc = chidb_Btree_newNode(*bt, &npage, PGTYPE_TABLE_LEAF);
-        if (rc == CHIDB_OK)
+        if (rc != CHIDB_OK)
         {
-            MemPage *page;
-            rc = chidb_Pager_readPage((*bt)->pager, 1, &page);
-            if (rc != CHIDB_OK)
-            {
-                goto exit_open;
-            }
-            strncpy((char *)page->data, "SQLite format 3", 16);
-            put2byte(&page->data[16], DEFAULT_PAGE_SIZE);
-            page->data[18] = 1;
-            page->data[19] = 1;
-            page->data[20] = 0;
-            page->data[21] = 64;
-            page->data[22] = 32;
-            page->data[23] = 32;
-            put4byte(&page->data[24], 0);
-            put4byte(&page->data[32], 0);
-            put4byte(&page->data[36], 0);
-            put4byte(&page->data[40], 0);
-            put4byte(&page->data[44], 1);
-            put4byte(&page->data[48], 20000);
-            put4byte(&page->data[52], 0);
-            put4byte(&page->data[56], 1);
-            put4byte(&page->data[60], 0);
-            put4byte(&page->data[64], 0);
-
-            chidb_Pager_writePage((*bt)->pager, page);
-            chidb_Pager_releaseMemPage((*bt)->pager, page);
+            goto EXIT;
         }
+        MemPage *page;
+        rc = chidb_Pager_readPage((*bt)->pager, 1, &page);
+        if (rc != CHIDB_OK)
+        {
+            goto EXIT;
+        }
+        strncpy((char *)page->data, "SQLite format 3", 16);
+        put2byte(&page->data[16], DEFAULT_PAGE_SIZE);
+        page->data[18] = 1;
+        page->data[19] = 1;
+        page->data[20] = 0;
+        page->data[21] = 64;
+        page->data[22] = 32;
+        page->data[23] = 32;
+        put4byte(&page->data[24], 0);
+        put4byte(&page->data[32], 0);
+        put4byte(&page->data[36], 0);
+        put4byte(&page->data[40], 0);
+        put4byte(&page->data[44], 1);
+        put4byte(&page->data[48], 20000);
+        put4byte(&page->data[52], 0);
+        put4byte(&page->data[56], 1);
+        put4byte(&page->data[60], 0);
+        put4byte(&page->data[64], 0);
+        chidb_Pager_writePage((*bt)->pager, page);
+        chidb_Pager_releaseMemPage((*bt)->pager, page);
+        return CHIDB_OK;
     }
-exit_open:
-    /* On success, no cleanup needed. Resources are available to caller. */
-    if (rc != CHIDB_OK)
+    else 
     {
-        if (*bt)
+        rc = verifyHeader(header_buf);
+        if (rc != CHIDB_OK)
         {
-            if ((*bt)->pager)
-            {
-                chidb_Pager_close((*bt)->pager);
-            }
-            free(*bt);
+            rc = CHIDB_ECORRUPTHEADER;
+            goto EXIT;
         }
+        uint16_t page_size = get2byte(header_buf + 16);
+        chidb_Pager_setPageSize((*bt)->pager, page_size);
+        return CHIDB_OK;
+    }
+EXIT:
+    if (*bt)
+    {
+        if ((*bt)->pager)
+        {
+            chidb_Pager_close((*bt)->pager);
+        }
+        free(*bt);
     }
     return rc;
 }
@@ -428,14 +226,14 @@ int chidb_Btree_getNodeByPage(BTree *bt, npage_t npage, BTreeNode **btn)
     }
 
     int rc = chidb_Pager_readPage(bt->pager, npage, &page);
-    if (rc != CHIDB_OK) // catch CHIDB_ENOMEM & CHIDB_EPAGENO
+    if (rc != CHIDB_OK)
     {
         free(*btn);
         *btn = NULL;
         return rc;
     }
 
-    packBufToNode(page, *btn);
+    packBTN(*btn, page);
     return CHIDB_OK;
 }
 
@@ -545,15 +343,15 @@ int chidb_Btree_initEmptyNode(BTree *bt, npage_t npage, uint8_t type)
 int chidb_Btree_writeNode(BTree *bt, BTreeNode *btn)
 {
     ptrdiff_t head_offset = getHeaderOffset(btn->page->npage);
-    uint8_t *head = btn->page->data + head_offset;
+    uint8_t *head = &btn->page->data[head_offset];
     head[PGHEADER_PGTYPE_OFFSET] = btn->type;
     head[PGHEADER_ZERO_OFFSET] = 0;
-    put2byte(head + PGHEADER_FREE_OFFSET,   btn->free_offset);
-    put2byte(head + PGHEADER_NCELLS_OFFSET, btn->n_cells);
-    put2byte(head + PGHEADER_CELL_OFFSET,   btn->cells_offset);
-    if (internalNode(btn->type))
+    put2byte(&head[PGHEADER_FREE_OFFSET], btn->free_offset);
+    put2byte(&head[PGHEADER_NCELLS_OFFSET], btn->n_cells);
+    put2byte(&head[PGHEADER_CELL_OFFSET], btn->cells_offset);
+    if (!(btn->type & FLAG_LEAF))
     {
-        put4byte(head + PGHEADER_RIGHTPG_OFFSET, btn->right_page);
+        put4byte(&head[PGHEADER_RIGHTPG_OFFSET], btn->right_page);
     }
     chidb_Pager_writePage(bt->pager, btn->page);
     return CHIDB_OK;
@@ -579,13 +377,40 @@ int chidb_Btree_writeNode(BTree *bt, BTreeNode *btn)
  */
 int chidb_Btree_getCell(BTreeNode *btn, ncell_t ncell, BTreeCell *cell)
 {
-    if (ncell > btn->n_cells)
+    if (ncell < 0 || ncell >= btn->n_cells)
     {
         return CHIDB_ECELLNO;
     }
     ptrdiff_t cell_offset = get2byte(btn->celloffset_array + 2*ncell);
     uint8_t *head = btn->page->data + cell_offset;
-    packBTC(head, cell, btn->type);
+    cell->type = btn->type;
+    switch (cell->type)
+    {
+        case PGTYPE_TABLE_INTERNAL:
+            getVarint32(&head[TABLEINTCELL_KEY_OFFSET], &cell->key);
+            cell->fields.tableInternal.child_page = 
+                get4byte(&head[TABLEINTCELL_CHILD_OFFSET]);
+            break;
+        case PGTYPE_TABLE_LEAF:
+            getVarint32(&head[TABLELEAFCELL_KEY_OFFSET], &cell->key);
+            getVarint32(&head[TABLELEAFCELL_SIZE_OFFSET],
+                    &cell->fields.tableLeaf.data_size);
+            cell->fields.tableLeaf.data =
+                &head[TABLELEAFCELL_DATA_OFFSET];
+            break;
+        case PGTYPE_INDEX_INTERNAL:
+            cell->key = get4byte(&head[INDEXINTCELL_KEYIDX_OFFSET]);
+            cell->fields.indexInternal.keyPk =
+                get4byte(&head[INDEXINTCELL_KEYPK_OFFSET]);
+            cell->fields.indexInternal.child_page =
+                get4byte(&head[INDEXINTCELL_CHILD_OFFSET]);
+            break;
+        case PGTYPE_INDEX_LEAF:
+            cell->key = get4byte(&head[INDEXLEAFCELL_KEYIDX_OFFSET]);
+            cell->fields.indexLeaf.keyPk =
+                get4byte(&head[INDEXLEAFCELL_KEYPK_OFFSET]);
+            break;
+    }
     return CHIDB_OK;
 }
 
@@ -620,8 +445,8 @@ int chidb_Btree_insertCell(BTreeNode *btn, ncell_t ncell, BTreeCell *cell)
     }
 
     ncell_t old_n_cells = btn->n_cells;
-    btn->n_cells += 1;
-    ptrdiff_t cell_offset = btn->cells_offset -= cellGetSize(cell);
+    btn->n_cells ++;
+    ptrdiff_t cell_offset = btn->cells_offset -= getCellSize(cell);
 
     unpackBTC(&btn->page->data[cell_offset], cell);
 
@@ -656,10 +481,87 @@ int chidb_Btree_insertCell(BTreeNode *btn, ncell_t ncell, BTreeCell *cell)
  */
 int chidb_Btree_find(BTree *bt, npage_t nroot, chidb_key_t key, uint8_t **data, uint16_t *size)
 {
-    return CHIDB_OK;
+    uint8_t rc = 0;
+    npage_t npage = nroot;
+    ncell_t ncell = 0;
+    BTreeNode *btn = NULL;
+    BTreeCell *btc_arr = NULL;
+    struct flags
+    {
+        bool match : 1;
+        bool table : 1;
+        bool leaf : 1;
+        bool index : 1;
+    } flags;
+
+    while (1)
+    {
+        rc = chidb_Btree_getNodeByPage(bt, npage, &btn);
+        if (rc != CHIDB_OK)
+            break;
+        rc = nodeBTCArray(btn, &btc_arr);
+        if (rc != CHIDB_OK)
+            break;
+
+        flags.table = btn->type & FLAG_TABLE;
+        flags.leaf = btn->type & FLAG_LEAF;
+        flags.index = btn->type & FLAG_INDEX;
+        flags.match = nodeKeyBSearch(btn, btc_arr, key, &ncell);
+
+        if (flags.match && flags.leaf && flags.table)
+        {
+            rc = cellRecordCpy(&btc_arr[ncell], data, size);
+            break;
+        }
+        else if (flags.match && flags.index)
+        {
+            if (flags.leaf)
+            {
+                key = btc_arr[ncell].fields.indexLeaf.keyPk;
+            }
+            else
+            {
+                key = btc_arr[ncell].fields.indexInternal.keyPk;
+            }
+            npage = nroot;
+        }
+        else if (!flags.leaf)
+        {
+            if (ncell == btn->n_cells)
+            {
+                npage = btn->right_page;
+            }
+            else if (flags.table)
+            {
+                npage = btc_arr[ncell].fields.tableInternal.child_page;
+            }
+            else
+            {
+                npage = btc_arr[ncell].fields.indexInternal.child_page;
+            }
+        }
+        else
+        {
+            rc = CHIDB_ENOTFOUND;
+            break;
+        }
+
+        chidb_Btree_freeMemNode(bt, btn);
+        btn = NULL;
+        free(btc_arr);
+        btc_arr = NULL;
+    }
+
+    if (btn)
+    {
+        chidb_Btree_freeMemNode(bt, btn);
+    }
+    if (btc_arr)
+    {
+        free(btc_arr);
+    }
+    return rc;
 }
-
-
 
 /* Insert an entry into a table B-Tree
  *
@@ -683,7 +585,18 @@ int chidb_Btree_find(BTree *bt, npage_t nroot, chidb_key_t key, uint8_t **data, 
  */
 int chidb_Btree_insertInTable(BTree *bt, npage_t nroot, chidb_key_t key, uint8_t *data, uint16_t size)
 {
-    return CHIDB_OK;
+    BTreeCell btc =
+    {
+        .type = PGTYPE_TABLE_LEAF,
+        .key = key,
+        .fields.tableLeaf =
+        {
+            .data_size = size,
+            .data = data
+        }
+    };
+    uint8_t rc = chidb_Btree_insert(bt, nroot, &btc);
+    return rc;
 }
 
 
@@ -708,7 +621,14 @@ int chidb_Btree_insertInTable(BTree *bt, npage_t nroot, chidb_key_t key, uint8_t
  */
 int chidb_Btree_insertInIndex(BTree *bt, npage_t nroot, chidb_key_t keyIdx, chidb_key_t keyPk)
 {
-    return CHIDB_OK;
+    BTreeCell btc =
+    {
+        .type = FLAG_INDEX,
+        .key = keyIdx, 
+        .fields.indexLeaf.keyPk = keyPk 
+    };
+    uint8_t rc = chidb_Btree_insert(bt, nroot, &btc);
+    return rc;
 }
 
 
@@ -793,5 +713,245 @@ int chidb_Btree_insertNonFull(BTree *bt, npage_t npage, BTreeCell *btc)
  */
 int chidb_Btree_split(BTree *bt, npage_t npage_parent, npage_t npage_child, ncell_t parent_ncell, npage_t *npage_child2)
 {
+    return CHIDB_OK;
+}
+
+int nodeKeyBSearch(BTreeNode *btn, BTreeCell *btc_arr, chidb_key_t key, ncell_t *ncell)
+{
+    int left = 0, right = btn->n_cells-1, mid;
+    while (left <= right)
+    {
+        mid = left + (right-left)/2;
+        if (btc_arr[mid].key < key)
+            left = mid + 1;
+        else if (btc_arr[mid].key > key)
+            right = mid - 1;
+        else
+        {
+            *ncell = mid;
+            return 1;
+        }
+    }
+    /* The left boundary provides a hint to find a child node.
+     * Although this assigns a signed int to an unsigned unsigned ncell_t, 
+     * boundary <l> will never be negative at any point in the bsearch.
+     */
+    *ncell = left;
+    return 0;
+}
+
+/* Rightshift chidb page type codes by 2 for adjacent array indices
+ * starting at 0. This allows the pgtype code to determine branching without
+ * conditional statements.
+ *
+ * Parameters:
+ *  - type: chidb page type code
+ * Return:
+ *  - PGTYPE_INDEX_INTERNAL : 0x00
+ *  - PGTYPE_TABLE_INTERNAL : 0x01
+ *  - PGTYPE_TABLE_LEAF     : 0x02
+ *  - PGTYPE_INDEX_LEAF     : 0x03
+ */
+uint8_t pgtypeMap(uint8_t type)
+{
+    return type >> 2;
+}
+
+/* Avoid clobbering 100B file header on page 1 when converting a note 
+ * to/from a buffer & BTreeNode struct.
+ */
+ptrdiff_t getHeaderOffset(npage_t npage)
+{
+    return (npage != 1) ? 0 : CHIDB_FILE_HEADER_LEN;
+}
+
+/* Given a cell type code, return the offset of the cell offset array
+ * in a page of that type. 
+ *
+ * Note: This value is also equal to the length of the page header.
+ */
+ptrdiff_t getCellOffsetOffset(uint8_t type)
+{
+    static const ptrdiff_t tab[2] =
+    {
+        INTPG_CELLSOFFSET_OFFSET,
+        LEAFPG_CELLSOFFSET_OFFSET
+    };
+
+    return tab[pgtypeMap(type) >> 1];
+}
+
+/* Check for default values for file header fields
+ *
+ * Parameters:
+ * - buf: pointer to 100 byte buffer storing a file header
+ *
+ * Return:
+ * - CHIDB_OK: File header is valid.
+ * - CHIDB_ECORRUPTHEADER: File header is not well formed.
+ */
+int verifyHeader(uint8_t *buf_head)
+{
+    /* for the current build, these are the only valid values */
+    bool invalid_header =
+    (
+            strncmp((char*)buf_head, "SQLite format 3" , 16) ||
+            buf_head[18] != 1                        ||
+            buf_head[19] != 1                        ||
+            buf_head[20] != 0                        ||
+            buf_head[21] != 64                       ||
+            buf_head[22] != 32                       ||
+            buf_head[23] != 32                       ||
+//          get4byte(&buf_head[24]) != 0             ||
+            get4byte(&buf_head[32]) != 0             ||
+            get4byte(&buf_head[36]) != 0             ||
+//          get4byte(&buf_head[40]) != 0             ||
+            get4byte(&buf_head[44]) != 1             ||
+            /* check_btree_1a.c: test_1a_4 */
+            get4byte(&buf_head[48]) != 20000         ||
+            get4byte(&buf_head[52]) != 0             ||
+            get4byte(&buf_head[56]) != 1             ||
+//          get4byte(&buf_head[60]) != 0             ||
+            get4byte(&buf_head[64]) != 0
+    );
+    if (invalid_header)
+    {
+        return CHIDB_ECORRUPTHEADER;
+    }
+    else
+    {
+        return CHIDB_OK;
+    }
+}
+
+/* Pack a BTreeNode with page header data
+ * The purpose of this function is to abstract the task of parsing and casting
+ * unstructured data from a buffered page header.
+ *
+ * Notes:
+ * - All resources pointed to by parameters are assumed to be 
+ *   already allocated.
+ * - The page is assumed to be well-formed.
+ * - On leaf nodes, the .right_page field will be set to 0 to indicate
+ *   that it is inapplicable.
+ * Parameters:
+ * - page: the MemPage struct that provides access to a buffered page
+ * - btn: the external BTreeNode struct to pack as an out parameter
+ */
+void packBTN(BTreeNode *btn, MemPage *page)
+{
+    uint8_t *head = &page->data[getHeaderOffset(page->npage)];
+    btn->page = page;
+    btn->type = head[PGHEADER_PGTYPE_OFFSET];
+    btn->free_offset = get2byte(&head[PGHEADER_FREE_OFFSET]);
+    btn->n_cells = get2byte(&head[PGHEADER_NCELLS_OFFSET]);
+    btn->cells_offset = get2byte(&head[PGHEADER_CELL_OFFSET]);
+    btn->celloffset_array = &head[getCellOffsetOffset(btn->type)];
+    if (!(btn->type & FLAG_LEAF))
+    {
+        btn->right_page = get4byte(&head[PGHEADER_RIGHTPG_OFFSET]);
+    }
+}
+
+void unpackBTC(uint8_t *head, const BTreeCell *btc)
+{
+    switch (btc->type)
+    {
+        case PGTYPE_TABLE_INTERNAL:
+            putVarint32(&head[TABLEINTCELL_KEY_OFFSET], btc->key);
+            put4byte(&head[TABLEINTCELL_CHILD_OFFSET],
+                    btc->fields.tableInternal.child_page);
+            return;
+        case PGTYPE_TABLE_LEAF:
+            putVarint32(&head[TABLELEAFCELL_KEY_OFFSET], btc->key);
+            putVarint32(&head[TABLELEAFCELL_SIZE_OFFSET], 
+                        btc->fields.tableLeaf.data_size);
+            uint8_t *record_head = &head[TABLELEAFCELL_DATA_OFFSET];
+            memmove(record_head,
+                    btc->fields.tableLeaf.data,
+                    btc->fields.tableLeaf.data_size);
+            return;
+        case PGTYPE_INDEX_INTERNAL:
+            put4byte(&head[INDEXINTCELL_KEYIDX_OFFSET], btc->key);
+            put4byte(&head[INDEXINTCELL_KEYPK_OFFSET],
+                    btc->fields.indexInternal.keyPk);
+            put4byte(&head[INDEXINTCELL_CHILD_OFFSET],
+                    btc->fields.indexInternal.child_page);
+            return;
+        case PGTYPE_INDEX_LEAF:
+            put4byte(&head[INDEXLEAFCELL_KEYIDX_OFFSET], btc->key);
+            put4byte(&head[INDEXLEAFCELL_KEYPK_OFFSET],
+                    btc->fields.indexLeaf.keyPk);
+            return;
+    }
+}
+
+/* Using the data of a BTreeCell struct, determine and return
+ * the size of the cell encoded in the chidb file format.
+ */
+size_t getCellSize(const BTreeCell *btc)
+{
+    const static size_t tab[4] =
+    {
+        INDEXINTCELL_SIZE,
+        TABLEINTCELL_SIZE,
+        INDEXLEAFCELL_SIZE,
+        TABLELEAFCELL_SIZE_WITHOUTDATA
+    };
+    int i = pgtypeMap(btc->type);
+    size_t size = tab[i];
+    if (btc->type & (FLAG_LEAF | FLAG_TABLE))
+    {
+        size += btc->fields.tableLeaf.data_size;
+    }
+    
+    return size;
+}
+
+/* Create an array of all keys of a BTreeNode
+ * Parameters:
+ *  - btn: pointer to node struct
+ *  - key_arr: double pointer to give caller access to array
+ * Return:
+ *  - CHIDB_OK: Operation successful.
+ *  - CHIDB_ENOMEM: Memory allocation failed.
+ *  - CHIDB_EEMPTY: Node is empty.
+ */
+int nodeBTCArray(BTreeNode *btn, BTreeCell **btc_arr)
+{
+    if (!btn->n_cells)
+    {
+        return CHIDB_ENOTFOUND;
+    }
+    *btc_arr = malloc(btn->n_cells * sizeof(**btc_arr));
+    if (!(*btc_arr))
+    {
+        return CHIDB_ENOMEM;
+    }
+    for (int i=0; i<btn->n_cells; i++)
+    {
+        int rc = chidb_Btree_getCell(btn, i, &(*btc_arr)[i]);
+        if (rc != CHIDB_OK)
+        {
+            free(*btc_arr);
+            return rc;
+        }
+    }
+    return CHIDB_OK;
+}
+
+/* Helper function to allocate a buffer and copy a record in an open db page.
+ * Parameters:
+ *  - btc: the cell from an open internal leaf node to access record.
+ */
+int cellRecordCpy(BTreeCell *btc, uint8_t **data, uint16_t *size)
+{
+    *size = btc->fields.tableLeaf.data_size;
+    *data = malloc(*size);
+    if (!*data)
+    {
+        return CHIDB_ENOMEM;
+    }
+    memcpy(*data, btc->fields.tableLeaf.data, *size);  
     return CHIDB_OK;
 }
